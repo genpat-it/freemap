@@ -1,0 +1,48 @@
+# Build artifacts
+/target/
+
+# Profiling data
+perf.data
+perf.data.old
+*.profraw
+*.profdata
+
+# Benchmark intermediate files
+benchmark/results/
+benchmark/micro/
+*.sam
+*.paf
+*.bam
+*.mmi
+*.fmi
+*.idx
+
+# Development notes (not for reviewers)
+*_ANALYSIS.md
+*.backup_ideas
+pgo_build.sh
+
+# Large data (symlinked)
+data/
+
+# Paper and presentation (separate repo)
+paper/
+presentation/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Internal development
+CLAUDE.md
+.claude/

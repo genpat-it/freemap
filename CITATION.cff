@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+  - family-names: de Ruvo
+    given-names: Andrea
+    affiliation: "Gran Sasso Science Institute"
+    orcid: "https://orcid.org/0000-0001-6836-3455"
+  - family-names: Radomski
+    given-names: Nicolas
+    affiliation: "Istituto Zooprofilattico Sperimentale dell'Abruzzo e del Molise"
+    orcid: "https://orcid.org/0000-0002-7480-4197"
+  - family-names: Flammini
+    given-names: Michele
+    affiliation: "Gran Sasso Science Institute"
+  - family-names: Di Pasquale
+    given-names: Adriano
+    affiliation: "Istituto Zooprofilattico Sperimentale dell'Abruzzo e del Molise"
+    orcid: "https://orcid.org/0000-0002-9328-3972"
+title: "freemap"
+version: "0.0.1"
+date-released: 2026-02-17
+license: MIT
+type: software
+abstract: "Trajectory-based long-read aligner with DP-free CIGAR generation"
+keywords:
+  - bioinformatics
+  - alignment
+  - long-reads
+  - sequence-alignment
+  - genomics
+repository-code: "https://github.com/genpat-it/freemap"
+doi: "10.5281/zenodo.18671716"

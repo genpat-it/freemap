@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="trajectory" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="50%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#ec4899"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#8b5cf6" stop-opacity="0.12"/>
+      <stop offset="100%" stop-color="#8b5cf6" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="blur">
+      <feGaussianBlur stdDeviation="10"/>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="512" height="512" rx="80" fill="#0c0a1a"/>
+
+  <!-- Subtle glow -->
+  <ellipse cx="270" cy="250" rx="200" ry="200" fill="url(#glow)"/>
+
+  <!-- === Axes === -->
+
+  <!-- Y axis (reference) -->
+  <line x1="75" y1="55" x2="75" y2="455" stroke="#ffffff" stroke-width="2" stroke-opacity="0.6"/>
+  <line x1="75" y1="55" x2="69" y2="70" stroke="#ffffff" stroke-width="2" stroke-opacity="0.6"/>
+  <line x1="75" y1="55" x2="81" y2="70" stroke="#ffffff" stroke-width="2" stroke-opacity="0.6"/>
+
+  <!-- X axis (query) -->
+  <line x1="75" y1="455" x2="455" y2="455" stroke="#ffffff" stroke-width="2" stroke-opacity="0.6"/>
+  <line x1="455" y1="455" x2="440" y2="449" stroke="#ffffff" stroke-width="2" stroke-opacity="0.6"/>
+  <line x1="455" y1="455" x2="440" y2="461" stroke="#ffffff" stroke-width="2" stroke-opacity="0.6"/>
+
+  <!-- Axis tick marks -->
+  <g stroke="#ffffff" stroke-width="1.5" stroke-opacity="0.35">
+    <line x1="75" y1="155" x2="84" y2="155"/>
+    <line x1="75" y1="255" x2="84" y2="255"/>
+    <line x1="75" y1="355" x2="84" y2="355"/>
+    <line x1="175" y1="455" x2="175" y2="446"/>
+    <line x1="275" y1="455" x2="275" y2="446"/>
+    <line x1="375" y1="455" x2="375" y2="446"/>
+  </g>
+
+  <!-- Noise seeds -->
+  <g fill="#94a3b8" opacity="0.1">
+    <circle cx="140" cy="150" r="3"/>
+    <circle cx="380" cy="190" r="2.5"/>
+    <circle cx="410" cy="310" r="3"/>
+    <circle cx="120" cy="360" r="2.5"/>
+    <circle cx="390" cy="400" r="3"/>
+    <circle cx="160" cy="420" r="2.5"/>
+    <circle cx="370" cy="120" r="3"/>
+    <circle cx="430" cy="230" r="2.5"/>
+    <circle cx="110" cy="230" r="3"/>
+    <circle cx="410" cy="370" r="2.5"/>
+  </g>
+
+  <!-- === "f" stem: bottom to top with hook === -->
+
+  <!-- Stem glow -->
+  <path d="M 220 435 C 220 340, 225 270, 230 210 C 235 150, 250 105, 310 88 Q 365 75, 400 95"
+        stroke="url(#trajectory)" stroke-width="10" fill="none" stroke-linecap="round"
+        filter="url(#blur)" opacity="0.5"/>
+
+  <!-- Stem crisp -->
+  <path d="M 220 435 C 220 340, 225 270, 230 210 C 235 150, 250 105, 310 88 Q 365 75, 400 95"
+        stroke="url(#trajectory)" stroke-width="3.5" fill="none" stroke-linecap="round"/>
+
+  <!-- === "f" crossbar === -->
+
+  <!-- Crossbar glow -->
+  <line x1="135" y1="255" x2="370" y2="255"
+        stroke="url(#trajectory)" stroke-width="10" stroke-linecap="round"
+        filter="url(#blur)" opacity="0.4"/>
+
+  <!-- Crossbar crisp -->
+  <line x1="135" y1="255" x2="370" y2="255"
+        stroke="url(#trajectory)" stroke-width="3.5" stroke-linecap="round"/>
+
+  <!-- === Anchor points along the "f" === -->
+
+  <!-- Stem anchors -->
+  <circle cx="220" cy="435" r="15" fill="#06b6d4" opacity="0.1"/>
+  <circle cx="220" cy="435" r="8" fill="#06b6d4"/>
+
+  <circle cx="222" cy="340" r="13" fill="#0ea5e9" opacity="0.1"/>
+  <circle cx="222" cy="340" r="7" fill="#0ea5e9"/>
+
+  <circle cx="227" cy="255" r="15" fill="#6366f1" opacity="0.12"/>
+  <circle cx="227" cy="255" r="8" fill="#6366f1"/>
+
+  <circle cx="232" cy="185" r="13" fill="#8b5cf6" opacity="0.1"/>
+  <circle cx="232" cy="185" r="7" fill="#8b5cf6"/>
+
+  <circle cx="258" cy="112" r="13" fill="#a855f7" opacity="0.1"/>
+  <circle cx="258" cy="112" r="7" fill="#a855f7"/>
+
+  <!-- Hook anchors -->
+  <circle cx="340" cy="82" r="13" fill="#d946ef" opacity="0.1"/>
+  <circle cx="340" cy="82" r="7" fill="#d946ef"/>
+
+  <circle cx="395" cy="93" r="13" fill="#ec4899" opacity="0.1"/>
+  <circle cx="395" cy="93" r="7" fill="#ec4899"/>
+
+  <!-- Crossbar anchors -->
+  <circle cx="135" cy="255" r="13" fill="#06b6d4" opacity="0.1"/>
+  <circle cx="135" cy="255" r="7" fill="#06b6d4"/>
+
+  <circle cx="300" cy="255" r="13" fill="#a855f7" opacity="0.1"/>
+  <circle cx="300" cy="255" r="7" fill="#a855f7"/>
+
+  <circle cx="370" cy="255" r="13" fill="#ec4899" opacity="0.1"/>
+  <circle cx="370" cy="255" r="7" fill="#ec4899"/>
+
+  <!-- Micro-anchor ticks along stem -->
+  <g stroke="#06b6d4" stroke-width="1.5" stroke-linecap="round" opacity="0.3">
+    <line x1="212" y1="400" x2="208" y2="390"/>
+    <line x1="214" y1="370" x2="210" y2="362"/>
+  </g>
+  <g stroke="#8b5cf6" stroke-width="1.5" stroke-linecap="round" opacity="0.3">
+    <line x1="224" y1="295" x2="220" y2="287"/>
+    <line x1="228" y1="225" x2="224" y2="217"/>
+  </g>
+  <g stroke="#d946ef" stroke-width="1.5" stroke-linecap="round" opacity="0.3">
+    <line x1="240" y1="148" x2="244" y2="140"/>
+    <line x1="280" y1="100" x2="290" y2="94"/>
+  </g>
+
+  <!-- Micro-anchor ticks along crossbar -->
+  <g stroke="#6366f1" stroke-width="1.5" stroke-linecap="round" opacity="0.3">
+    <line x1="175" y1="250" x2="190" y2="250"/>
+    <line x1="205" y1="260" x2="218" y2="260"/>
+    <line x1="340" y1="250" x2="352" y2="250"/>
+  </g>
+</svg>
