@@ -19,6 +19,7 @@ crossbeam-channel = "0.5"  # Lock-free channels for streaming FASTQ
 smallvec = "1.13"  # Stack-allocated small vectors for anchors
 needletail = "0.5"  # Fast FASTA/FASTQ parsing (2-3× faster than custom parser)
 itoa = "1.0"  # Fast integer-to-string conversion for CIGAR
+flate2 = "1"  # gzip decompression for .gz FASTQ/FASTA inputs
 
 [profile.release]
 lto = true

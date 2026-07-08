@@ -270,7 +270,16 @@ fn parse_fasta(path: &str) -> Vec<(String, Vec<u8>)> {
 
 fn parse_fastq(path: &str) -> Vec<FastqRecord> {
     let file = File::open(path).unwrap_or_else(|e| panic!("Cannot open FASTQ file: {}", e));
-    let mut reader = BufReader::with_capacity(1 << 20, file);
+    // Transparently decompress gzip input. Without this, a .gz file was read as raw bytes,
+    // no line started with '@', and parsing silently returned 0 reads (minimap2 reads .gz).
+    let mut reader: Box<dyn BufRead> = if path.ends_with(".gz") {
+        Box::new(BufReader::with_capacity(
+            1 << 20,
+            flate2::read::MultiGzDecoder::new(file),
+        ))
+    } else {
+        Box::new(BufReader::with_capacity(1 << 20, file))
+    };
 
     let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let estimated_records = (file_size / 400) as usize;
@@ -2928,6 +2937,135 @@ fn add_cigar_op_fast(ops: &mut Vec<(char, usize)>, op: char, len: usize) {
     ops.push((op, len));
 }
 
+/// Optimal affine-gap (Gotoh) global alignment of two SHORT segments, returning CIGAR ops.
+/// Used by the optional DP-polish mode (`--dp`) in place of the greedy `diagonal_align_refined`,
+/// to place indels/mismatches optimally between anchors. DP is confined to short inter-anchor
+/// gaps (dense anchors → cheap), keeping overall alignment fast. Falls back to the greedy path
+/// for over-long segments (caller-enforced). Costs: match 0, mismatch 4, gap-open 6, extend 1.
+fn nw_affine_cigar(query: &[u8], target: &[u8]) -> Vec<(char, usize)> {
+    let n = query.len();
+    let m = target.len();
+    if n == 0 && m == 0 {
+        return Vec::new();
+    }
+    if n == 0 {
+        return vec![('D', m)];
+    }
+    if m == 0 {
+        return vec![('I', n)];
+    }
+    const MM: i32 = 4; // mismatch cost
+    const GO: i32 = 6; // gap open (added on the first gap base)
+    const GE: i32 = 1; // gap extend (per gap base)
+    const INF: i32 = 1 << 28;
+    let w = m + 1;
+    let idx = |i: usize, j: usize| i * w + j;
+    // mm = best ending in match/mismatch; ix = ending in insertion (gap in target, consumes
+    // query); iy = ending in deletion (gap in query, consumes target).
+    let mut mm = vec![INF; (n + 1) * w];
+    let mut ix = vec![INF; (n + 1) * w];
+    let mut iy = vec![INF; (n + 1) * w];
+    mm[idx(0, 0)] = 0;
+    for i in 1..=n {
+        ix[idx(i, 0)] = GO + GE * i as i32;
+    }
+    for j in 1..=m {
+        iy[idx(0, j)] = GO + GE * j as i32;
+    }
+    for i in 1..=n {
+        for j in 1..=m {
+            let sub = if query[i - 1] == target[j - 1] { 0 } else { MM };
+            let diag = mm[idx(i - 1, j - 1)]
+                .min(ix[idx(i - 1, j - 1)])
+                .min(iy[idx(i - 1, j - 1)]);
+            mm[idx(i, j)] = diag.saturating_add(sub);
+            ix[idx(i, j)] = (mm[idx(i - 1, j)] + GO + GE).min(ix[idx(i - 1, j)] + GE);
+            iy[idx(i, j)] = (mm[idx(i, j - 1)] + GO + GE).min(iy[idx(i, j - 1)] + GE);
+        }
+    }
+    // Traceback from the cheapest of the three final states.
+    let mut state = {
+        let (mut s, mut best) = (0u8, mm[idx(n, m)]);
+        if ix[idx(n, m)] < best {
+            s = 1;
+            best = ix[idx(n, m)];
+        }
+        if iy[idx(n, m)] < best {
+            s = 2;
+        }
+        s
+    };
+    let (mut i, mut j) = (n, m);
+    let mut rev: Vec<(char, usize)> = Vec::with_capacity(16);
+    while i > 0 || j > 0 {
+        match state {
+            0 => {
+                // came into mm[i][j] from diag (min of the three at i-1,j-1)
+                let sub = if query[i - 1] == target[j - 1] { 0 } else { MM };
+                let target_cost = mm[idx(i, j)] - sub;
+                add_cigar_op_fast(&mut rev, 'M', 1);
+                let (pi, pj) = (i - 1, j - 1);
+                state = if mm[idx(pi, pj)] == target_cost {
+                    0
+                } else if ix[idx(pi, pj)] == target_cost {
+                    1
+                } else {
+                    2
+                };
+                i = pi;
+                j = pj;
+            }
+            1 => {
+                // insertion: consumes query
+                let from_open = mm[idx(i - 1, j)] + GO + GE;
+                add_cigar_op_fast(&mut rev, 'I', 1);
+                state = if ix[idx(i, j)] == from_open { 0 } else { 1 };
+                i -= 1;
+            }
+            _ => {
+                // deletion: consumes target
+                let from_open = mm[idx(i, j - 1)] + GO + GE;
+                add_cigar_op_fast(&mut rev, 'D', 1);
+                state = if iy[idx(i, j)] == from_open { 0 } else { 2 };
+                j -= 1;
+            }
+        }
+    }
+    rev.reverse();
+    // merge adjacent same-op runs (add_cigar_op_fast already merged consecutive pushes,
+    // but reversal can juxtapose equal ops across the boundary of runs)
+    let mut out: Vec<(char, usize)> = Vec::with_capacity(rev.len());
+    for (op, len) in rev {
+        if let Some(last) = out.last_mut() {
+            if last.0 == op {
+                last.1 += len;
+                continue;
+            }
+        }
+        out.push((op, len));
+    }
+    out
+}
+
+/// Global flag: when set (`--dp`), the polish gap aligner uses optimal affine-gap DP
+/// (`nw_affine_cigar`) on short segments instead of the greedy heuristic. Set once in main().
+static DP_POLISH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Align a gap/segment for CIGAR polishing: optimal affine-gap DP when `--dp` is enabled and
+/// the segment is short enough (DP confined to short inter-anchor gaps keeps alignment fast),
+/// otherwise the greedy heuristic (default; behaviour unchanged when `--dp` is off).
+#[inline]
+fn polish_gap(query: &[u8], target: &[u8], max_indel: usize) -> Vec<(char, usize)> {
+    if DP_POLISH.load(std::sync::atomic::Ordering::Relaxed)
+        && query.len() <= 512
+        && target.len() <= 512
+    {
+        nw_affine_cigar(query, target)
+    } else {
+        diagonal_align_refined(query, target, max_indel)
+    }
+}
+
 #[inline]
 fn add_cigar_op(ops: &mut Vec<(char, usize)>, op: char, len: usize) {
     if let Some(last) = ops.last_mut() {
@@ -3523,6 +3661,17 @@ fn align_trajectory_based(
     // - Offset analysis confirms current implementation is optimal (offset=0)
     // =========================================================================
 
+    // POS = reference position at read_pos=0, from trajectory extrapolation (intercept).
+    // The leading region [0, anchor_read_start) is ALIGNED (below), not soft-clipped, so
+    // that POS is consistent with the CIGAR and read-start bases contribute to coverage /
+    // variant calling — matching minimap2's DP-extension behaviour.
+    //
+    // BUGFIX: previously this region was soft-clipped while POS was set to the intercept.
+    // A soft-clip consumes QUERY only (no reference), so the first 'M' base actually landed
+    // ~anchor_read_start bases to the RIGHT of POS: every 'M' base was frame-shifted against
+    // the reference and base-level identity collapsed to ~random (~28% on ONT), even though
+    // coarse metrics (placement within 500bp, coverage in kb bins, indel-event counts) all
+    // passed and hid the defect. Aligning the leading region restores ~98% identity.
     let mut ref_start = intercept.max(0.0) as usize;
 
     // Optionally refine boundary using micro-anchors (smaller k-mers)
@@ -3556,9 +3705,37 @@ fn align_trajectory_based(
 
     let mut all_ops: Vec<(char, usize)> = Vec::with_capacity(anchors.len() * 2);
 
-    // Leading region (before first anchor) - soft-clip (not verified)
+    // Leading region (read[0..anchor_read_start]): ALIGN it against the reference window
+    // [ref_start, first.ref_start) instead of soft-clipping, so the read-start bases
+    // contribute to coverage / variant calling (like minimap2's extension). Guards:
+    //  - cap the extended length (BOUNDARY_EXTEND_CAP): long unanchored prefixes are
+    //    usually adapters / N-runs / junk that minimap2 also soft-clips (z-drop);
+    //  - require read and reference spans to be comparable (slope ~ 1) — otherwise the
+    //    extrapolation is unreliable and we soft-clip, anchoring POS at the first anchor.
+    const BOUNDARY_EXTEND_CAP: usize = 1000;
     if anchor_read_start > 0 {
-        add_cigar_op(&mut all_ops, 'S', anchor_read_start);
+        let lead_ref_end = first.ref_start as usize;
+        let lead_ref_len = lead_ref_end.saturating_sub(ref_start);
+        let spans_ok = lead_ref_len > 0
+            && lead_ref_end <= reference.len()
+            && lead_ref_len <= anchor_read_start.saturating_mul(2) + 16
+            && anchor_read_start <= lead_ref_len.saturating_mul(2) + 16;
+        if anchor_read_start <= BOUNDARY_EXTEND_CAP && spans_ok {
+            let lead_read = &read[0..anchor_read_start];
+            let lead_ref = &reference[ref_start..lead_ref_end];
+            let ops = if polish && anchor_read_start.abs_diff(lead_ref_len) <= polish_max_indel {
+                polish_gap(lead_read, lead_ref, polish_max_indel)
+            } else {
+                fast_gap_align(lead_read, lead_ref)
+            };
+            for (op, len) in ops {
+                add_cigar_op(&mut all_ops, op, len);
+            }
+        } else {
+            // Unreliable / over-long prefix: soft-clip it and anchor POS at the first anchor.
+            add_cigar_op(&mut all_ops, 'S', anchor_read_start);
+            ref_start = lead_ref_end;
+        }
     }
 
     // Process consecutive anchor pairs - THIS IS THE KEY TRAJECTORY ANALYSIS
@@ -3609,7 +3786,7 @@ fn align_trajectory_based(
                 add_cigar_op(&mut all_ops, 'I', read_gap);
             } else if read_gap.abs_diff(ref_gap) <= polish_max_indel {
                 // Small indel: diagonal_align_refined can detect it directly
-                let gap_ops = diagonal_align_refined(gap_read, gap_ref, polish_max_indel);
+                let gap_ops = polish_gap(gap_read, gap_ref, polish_max_indel);
                 for (op, len) in gap_ops {
                     add_cigar_op(&mut all_ops, op, len);
                 }
@@ -3619,7 +3796,7 @@ fn align_trajectory_based(
                 // 2. Emit the structural indel (excess) geometrically
                 let overlap = std::cmp::min(read_gap, ref_gap);
                 if overlap > 0 {
-                    let gap_ops = diagonal_align_refined(&gap_read[..overlap], &gap_ref[..overlap], polish_max_indel);
+                    let gap_ops = polish_gap(&gap_read[..overlap], &gap_ref[..overlap], polish_max_indel);
                     for (op, len) in gap_ops {
                         add_cigar_op(&mut all_ops, op, len);
                     }
@@ -3648,10 +3825,31 @@ fn align_trajectory_based(
         }
     }
 
-    // Trailing region (after last anchor) - soft-clip (not verified)
+    // Trailing region (read[anchor_read_end..]): ALIGN it against the reference window
+    // [last_anchor_ref_end, ref_end) instead of soft-clipping (symmetric to the leading
+    // region above; same cap and span-ratio guards).
     let remaining = read.len().saturating_sub(anchor_read_end);
     if remaining > 0 {
-        add_cigar_op(&mut all_ops, 'S', remaining);
+        let trail_ref_start = last_anchor_ref_end;
+        let trail_ref_end = ref_end.min(reference.len());
+        let trail_ref_len = trail_ref_end.saturating_sub(trail_ref_start);
+        let spans_ok = trail_ref_len > 0
+            && trail_ref_len <= remaining.saturating_mul(2) + 16
+            && remaining <= trail_ref_len.saturating_mul(2) + 16;
+        if remaining <= BOUNDARY_EXTEND_CAP && spans_ok {
+            let trail_read = &read[anchor_read_end..read_end];
+            let trail_ref = &reference[trail_ref_start..trail_ref_end];
+            let ops = if polish && remaining.abs_diff(trail_ref_len) <= polish_max_indel {
+                polish_gap(trail_read, trail_ref, polish_max_indel)
+            } else {
+                fast_gap_align(trail_read, trail_ref)
+            };
+            for (op, len) in ops {
+                add_cigar_op(&mut all_ops, op, len);
+            }
+        } else {
+            add_cigar_op(&mut all_ops, 'S', remaining);
+        }
     }
 
     // Compact CIGAR
@@ -4458,130 +4656,61 @@ fn align_read_single_strand_compressed<I: KmerIndex>(
             })
             .collect();
 
-        // Generate CIGAR from anchor gaps (same logic as align_trajectory_based)
+        // Generate the CIGAR by BASE-ALIGNING in ORIGINAL coordinates, segment by segment
+        // between consecutive decompressed anchor start positions.
+        //
+        // The anchors are exact matches in COMPRESSED space, but in original space read and
+        // reference homopolymer run lengths differ, so emitting anchor / equal-gap regions as
+        // plain 'M' (as the previous version did) left ~18% residual base error at homopolymer
+        // boundaries. Polishing each segment with diagonal_align_refined resolves those bases,
+        // while the dense HPC anchors act as re-sync points -> accurate original-space alignment.
+        // POS is the first decompressed anchor's reference position (leading region soft-clipped).
         let mut all_ops: Vec<(char, usize)> = Vec::with_capacity(orig_anchors.len() * 2);
-
         let first = &orig_anchors[0];
         let last = &orig_anchors[orig_anchors.len() - 1];
         let anchor_read_start = first.read_start as usize;
         let anchor_read_end = last.read_start as usize + last.len as usize;
-        let _anchor_ref_start = first.ref_start as usize;
-        let _anchor_ref_end = last.ref_start as usize + last.len as usize;
-
-        // Track reference consumed for correct ref_end calculation
         let mut total_ref_consumed: usize = 0;
 
         // Leading region (before first anchor) - soft-clip (not verified by anchors)
         if anchor_read_start > 0 {
             add_cigar_op(&mut all_ops, 'S', anchor_read_start);
-            // Soft-clips don't consume reference
         }
 
-        // Process consecutive anchor pairs
-        for i in 0..orig_anchors.len() - 1 {
-            let curr = &orig_anchors[i];
-            let next = &orig_anchors[i + 1];
+        // Segment boundaries: each anchor's start position, plus the final aligned end.
+        let mut read_bounds: Vec<usize> =
+            orig_anchors.iter().map(|a| a.read_start as usize).collect();
+        read_bounds.push(anchor_read_end);
+        let mut ref_bounds: Vec<usize> =
+            orig_anchors.iter().map(|a| a.ref_start as usize).collect();
+        ref_bounds.push(last.ref_start as usize + last.len as usize);
 
-            let curr_read_end = curr.read_start as usize + curr.len as usize;
-            let curr_ref_end = curr.ref_start as usize + curr.len as usize;
-            let next_read_start = next.read_start as usize;
-            let next_ref_start = next.ref_start as usize;
-
-            // Gap between anchors
-            let read_gap = next_read_start.saturating_sub(curr_read_end);
-            let ref_gap = next_ref_start.saturating_sub(curr_ref_end);
-
-            // Current anchor contributes matches
-            if i == 0 {
-                add_cigar_op(&mut all_ops, 'M', curr.len as usize);
-                total_ref_consumed += curr.len as usize;
+        for s in 0..read_bounds.len() - 1 {
+            let r0 = read_bounds[s];
+            let r1 = read_bounds[s + 1].max(r0);
+            let f0 = ref_bounds[s];
+            let f1 = ref_bounds[s + 1].max(f0);
+            if r1 > read.len() || f1 > original_ref.len() {
+                break; // safety: implausible decompressed coordinates
             }
-
-            // Analyze gap between anchors
-            const MAX_INDEL_SIZE: usize = 50000; // 50kb max indel
-            let indel_size = if ref_gap > read_gap {
-                ref_gap - read_gap
+            let rseg = &read[r0..r1];
+            let fseg = &original_ref[f0..f1];
+            let seg_ops: Vec<(char, usize)> = if rseg.is_empty() && fseg.is_empty() {
+                Vec::new()
+            } else if rseg.is_empty() {
+                vec![('D', fseg.len())]
+            } else if fseg.is_empty() {
+                vec![('I', rseg.len())]
+            } else if polish {
+                polish_gap(rseg, fseg, polish_max_indel)
             } else {
-                read_gap - ref_gap
+                fast_gap_align(rseg, fseg)
             };
-
-            if indel_size > MAX_INDEL_SIZE {
-                add_cigar_op(&mut all_ops, 'M', read_gap);
-                total_ref_consumed += read_gap;
-                add_cigar_op(&mut all_ops, 'M', next.len as usize);
-                total_ref_consumed += next.len as usize;
-            } else if read_gap == 0 && ref_gap == 0 {
-                add_cigar_op(&mut all_ops, 'M', next.len as usize);
-                total_ref_consumed += next.len as usize;
-            } else if polish && read_gap != ref_gap
-                && (read_gap > 0 || ref_gap > 0)
-                && curr_ref_end + ref_gap <= original_ref.len()
-                && curr_read_end + read_gap <= read.len()
-            {
-                // POLISH MODE (HPC): refine gaps with unequal sizes using sequence comparison
-                // For equal-size gaps, keep geometric estimation (HPC decompression
-                // introduces position artifacts that make equal-gap polishing unreliable)
-                let gap_read = &read[curr_read_end..curr_read_end + read_gap];
-                let gap_ref = &original_ref[curr_ref_end..curr_ref_end + ref_gap];
-
-                if gap_read.is_empty() && !gap_ref.is_empty() {
-                    add_cigar_op(&mut all_ops, 'D', ref_gap);
-                    total_ref_consumed += ref_gap;
-                } else if !gap_read.is_empty() && gap_ref.is_empty() {
-                    add_cigar_op(&mut all_ops, 'I', read_gap);
-                } else if read_gap.abs_diff(ref_gap) <= polish_max_indel {
-                    // Small indel: diagonal_align_refined can detect it directly
-                    let gap_ops = diagonal_align_refined(gap_read, gap_ref, polish_max_indel);
-                    for (op, len) in &gap_ops {
-                        add_cigar_op(&mut all_ops, *op, *len);
-                        if *op == 'M' || *op == 'D' {
-                            total_ref_consumed += *len;
-                        }
-                    }
-                } else {
-                    // Large indel: hybrid approach
-                    // 1. Polish the overlapping (equal-length) portion for base-level detail
-                    // 2. Emit the structural indel (excess) geometrically
-                    let overlap = std::cmp::min(read_gap, ref_gap);
-                    if overlap > 0 {
-                        let gap_ops = diagonal_align_refined(&gap_read[..overlap], &gap_ref[..overlap], polish_max_indel);
-                        for (op, len) in &gap_ops {
-                            add_cigar_op(&mut all_ops, *op, *len);
-                            if *op == 'M' || *op == 'D' {
-                                total_ref_consumed += *len;
-                            }
-                        }
-                    }
-                    if read_gap > ref_gap {
-                        add_cigar_op(&mut all_ops, 'I', read_gap - ref_gap);
-                    } else {
-                        let excess = ref_gap - read_gap;
-                        add_cigar_op(&mut all_ops, 'D', excess);
-                        total_ref_consumed += excess;
-                    }
+            for (op, len) in seg_ops {
+                add_cigar_op(&mut all_ops, op, len);
+                if op == 'M' || op == 'D' || op == 'N' || op == '=' || op == 'X' {
+                    total_ref_consumed += len;
                 }
-                add_cigar_op(&mut all_ops, 'M', next.len as usize);
-                total_ref_consumed += next.len as usize;
-            } else if read_gap == ref_gap {
-                add_cigar_op(&mut all_ops, 'M', read_gap);
-                total_ref_consumed += read_gap;
-                add_cigar_op(&mut all_ops, 'M', next.len as usize);
-                total_ref_consumed += next.len as usize;
-            } else if ref_gap > read_gap {
-                // DELETION: reference advanced more than read
-                add_cigar_op(&mut all_ops, 'M', read_gap);
-                total_ref_consumed += read_gap;
-                add_cigar_op(&mut all_ops, 'D', ref_gap - read_gap);
-                total_ref_consumed += ref_gap - read_gap;
-                add_cigar_op(&mut all_ops, 'M', next.len as usize);
-                total_ref_consumed += next.len as usize;
-            } else {
-                // INSERTION: read advanced more than reference
-                add_cigar_op(&mut all_ops, 'M', ref_gap);
-                total_ref_consumed += ref_gap;
-                add_cigar_op(&mut all_ops, 'I', read_gap - ref_gap);
-                add_cigar_op(&mut all_ops, 'M', next.len as usize);
-                total_ref_consumed += next.len as usize;
             }
         }
 
@@ -4589,7 +4718,6 @@ fn align_read_single_strand_compressed<I: KmerIndex>(
         let remaining = read.len().saturating_sub(anchor_read_end);
         if remaining > 0 {
             add_cigar_op(&mut all_ops, 'S', remaining);
-            // Soft-clips don't consume reference
         }
 
         // Compact CIGAR
@@ -4607,20 +4735,10 @@ fn align_read_single_strand_compressed<I: KmerIndex>(
             compact.push((op, len));
         }
 
-        // Position estimation: use first anchor's position
-        let first_anchor = &orig_anchors[0];
-        let estimated_ref_start = first_anchor
-            .ref_start
-            .saturating_sub(first_anchor.read_start) as usize;
-
-        // K-MER SCAN: Refine ref_start with larger window (2kb) to catch position errors
-        let ref_start_calc =
-            refine_ref_start_kmer_scan(read, original_ref, estimated_ref_start, 15, 2000);
-
         (
             cigar_to_string(&compact),
             total_ref_consumed,
-            ref_start_calc,
+            orig_anchors[0].ref_start as usize,
         )
     } else {
         // Single anchor - simple CIGAR
@@ -5592,6 +5710,13 @@ fn main() {
             }
             "-H" => {
                 homopolymer_mode = true;
+            }
+            "--dp" => {
+                // Optional DP polish: replace the greedy gap aligner with optimal affine-gap
+                // DP on short inter-anchor gaps (better indel/mismatch placement for
+                // base-level tasks like variant calling; DP is confined to short gaps so it
+                // stays fast). Off by default (DP-free trajectory remains the default).
+                DP_POLISH.store(true, std::sync::atomic::Ordering::Relaxed);
             }
             "-r" => {
                 refine_boundaries = true;
@@ -7194,6 +7319,52 @@ mod tests {
         assert!(diagonal_align_refined(b"", b"", 4).is_empty());
         assert_eq!(diagonal_align_refined(b"", b"ACGT", 4), vec![('D', 4)]);
         assert_eq!(diagonal_align_refined(b"ACGT", b"", 4), vec![('I', 4)]);
+    }
+
+    #[test]
+    fn test_nw_affine_cigar() {
+        // helpers
+        let qlen = |ops: &[(char, usize)]| -> usize {
+            ops.iter().filter(|(o, _)| matches!(o, 'M' | 'I')).map(|(_, l)| l).sum()
+        };
+        let tlen = |ops: &[(char, usize)]| -> usize {
+            ops.iter().filter(|(o, _)| matches!(o, 'M' | 'D')).map(|(_, l)| l).sum()
+        };
+        // identical -> single M run
+        assert_eq!(nw_affine_cigar(b"ACGTACGT", b"ACGTACGT"), vec![('M', 8)]);
+        // single mismatch stays M (M does not distinguish match/mismatch)
+        assert_eq!(nw_affine_cigar(b"ACGTACGT", b"ACGAACGT"), vec![('M', 8)]);
+        // clean single-base deletion (target longer): query aligns with one D
+        let d = nw_affine_cigar(b"ACGTACGT", b"ACGTTACGT");
+        assert_eq!(qlen(&d), 8);
+        assert_eq!(tlen(&d), 9);
+        assert_eq!(d.iter().filter(|(o, _)| *o == 'D').map(|(_, l)| *l).sum::<usize>(), 1);
+        // clean single-base insertion (query longer)
+        let ins = nw_affine_cigar(b"ACGTTACGT", b"ACGTACGT");
+        assert_eq!(qlen(&ins), 9);
+        assert_eq!(tlen(&ins), 8);
+        assert_eq!(ins.iter().filter(|(o, _)| *o == 'I').map(|(_, l)| *l).sum::<usize>(), 1);
+        // empties
+        assert!(nw_affine_cigar(b"", b"").is_empty());
+        assert_eq!(nw_affine_cigar(b"", b"ACGT"), vec![('D', 4)]);
+        assert_eq!(nw_affine_cigar(b"ACGT", b""), vec![('I', 4)]);
+        // affine gaps: a contiguous 3bp deletion should be ONE D3, not split
+        let d3 = nw_affine_cigar(b"ACGTACGT", b"ACGTGGGACGT");
+        assert_eq!(qlen(&d3), 8);
+        assert_eq!(tlen(&d3), 11);
+        assert!(d3.iter().any(|(o, l)| *o == 'D' && *l == 3));
+        // conservation on random-ish cases
+        let cases: Vec<(&[u8], &[u8])> = vec![
+            (b"ACGTACGTACGT", b"ACGTACGTACGT"),
+            (b"ACGTTTACGT", b"ACGTACGT"),
+            (b"ACGTACGT", b"ACGTTTACGT"),
+            (b"AAACCCGGG", b"AAACCGGG"),
+        ];
+        for (q, t) in cases {
+            let ops = nw_affine_cigar(q, t);
+            assert_eq!(qlen(&ops), q.len());
+            assert_eq!(tlen(&ops), t.len());
+        }
     }
 
     #[test]
